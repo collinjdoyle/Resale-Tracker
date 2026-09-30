@@ -3,8 +3,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { db, UPLOAD_DIR, listItems, getItem, stats, getFees, setFees } from './db.js';
-import { identify, findMatches, aiEnabled } from './ai.js';
+import { db, UPLOAD_DIR, listItems, getItem, stats, getFees, setFees, getSetting, setSetting, listExpenses, addExpense, deleteExpense, STALE_DAYS } from './db.js';
+import { identify, writeListing, findMatches, aiEnabled } from './ai.js';
 import { lookupUpc } from './upc.js';
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -35,7 +35,7 @@ app.post('/api/login', (req, res) => {
   res.setHeader('Set-Cookie', `auth=${token()}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${60 * 60 * 24 * 365}`);
   res.json({ ok: true });
 });
-app.get('/api/session', (req, res) => res.json({ authed: authed(req), currency: CURRENCY, ai: aiEnabled(), passwordRequired: !!PASSWORD }));
+app.get('/api/session', (req, res) => res.json({ authed: authed(req), currency: CURRENCY, ai: aiEnabled(), passwordRequired: !!PASSWORD, staleDays: STALE_DAYS }));
 
 app.use(['/api', '/uploads'], (req, res, next) => authed(req) ? next() : res.status(401).json({ error: 'Login required' }));
 app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '30d', immutable: true }));
@@ -50,6 +50,7 @@ function itemValues(b) {
   const v = {};
   for (const f of ITEM_FIELDS) if (b[f] !== undefined) v[f] = String(b[f] ?? '').trim();
   if (b.cost !== undefined) v.cost = num(b.cost);
+  if (b.list_price !== undefined) v.list_price = b.list_price === '' || b.list_price === null ? null : num(b.list_price);
   if (b.status !== undefined && ['in_stock', 'listed', 'sold'].includes(b.status)) v.status = b.status;
   if (v.upc) v.upc = v.upc.replace(/\D/g, '');
   return v;
@@ -178,16 +179,56 @@ app.post('/api/identify', wrap(async req => {
   return { ai, upcProduct, matches };
 }));
 
+// ---------- listing text generator ----------
+app.post('/api/items/:id/listing', wrap(async req => {
+  const item = getItem(Number(req.params.id));
+  if (!item) throw Object.assign(new Error('Not found'), { status: 404 });
+  let photo = null;
+  const first = db.prepare('SELECT filename FROM photos WHERE item_id=? ORDER BY id LIMIT 1').get(item.id);
+  if (first) {
+    const file = path.join(UPLOAD_DIR, first.filename);
+    photo = { buf: fs.readFileSync(file), mime: file.endsWith('.png') ? 'image/png' : file.endsWith('.webp') ? 'image/webp' : 'image/jpeg' };
+  }
+  return writeListing(item, String(req.body?.platform || 'ebay'), photo);
+}));
+
+// ---------- expenses & settings ----------
+app.get('/api/expenses', (_req, res) => res.json(listExpenses()));
+app.post('/api/expenses', (req, res) => {
+  const b = req.body || {};
+  const amount = num(b.amount);
+  if (!(amount > 0)) return res.status(400).json({ error: 'Amount must be greater than 0' });
+  addExpense({
+    date: b.date || today(), category: String(b.category || 'other').slice(0, 40), amount,
+    miles: b.miles ? num(b.miles) : null, note: String(b.note || '').slice(0, 200),
+  });
+  res.status(201).json(listExpenses());
+});
+app.delete('/api/expenses/:id', (req, res) => { deleteExpense(Number(req.params.id)); res.json(listExpenses()); });
+
+app.get('/api/settings', (_req, res) => res.json({ goal: getSetting('goal', 0), mileage_rate: getSetting('mileage_rate', 0.7) }));
+app.put('/api/settings', (req, res) => {
+  if (req.body?.goal !== undefined) setSetting('goal', Math.max(0, num(req.body.goal)));
+  if (req.body?.mileage_rate !== undefined) setSetting('mileage_rate', Math.max(0, num(req.body.mileage_rate)));
+  res.json({ goal: getSetting('goal', 0), mileage_rate: getSetting('mileage_rate', 0.7) });
+});
+
 // ---------- fees, stats, export ----------
 app.get('/api/fees', (_req, res) => res.json(getFees()));
 app.put('/api/fees', (req, res) => { setFees(req.body); res.json(getFees()); });
 app.get('/api/stats', (_req, res) => res.json(stats()));
 
 app.get('/api/export.csv', (_req, res) => {
-  const cols = ['id', 'title', 'brand', 'category', 'condition', 'size', 'upc', 'cost', 'bought_date', 'bought_from', 'status', 'platform', 'sold_price', 'fees', 'shipping', 'sold_date', 'profit', 'notes'];
+  const cols = ['id', 'title', 'brand', 'category', 'condition', 'size', 'upc', 'cost', 'list_price', 'days_held', 'bought_date', 'bought_from', 'status', 'platform', 'sold_price', 'fees', 'shipping', 'sold_date', 'profit', 'notes'];
   const esc = v => v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
   const rows = listItems().map(i => cols.map(c => esc(i[c])).join(','));
   res.type('text/csv').attachment('resale-export.csv').send([cols.join(','), ...rows].join('\n'));
+});
+
+app.get('/api/expenses.csv', (_req, res) => {
+  const cols = ['date', 'category', 'amount', 'miles', 'note'];
+  const esc = v => v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
+  res.type('text/csv').attachment('expenses-export.csv').send([cols.join(','), ...listExpenses().map(e => cols.map(c => esc(e[c])).join(','))].join('\n'));
 });
 
 // Container stop/update sends SIGTERM: finish requests and close SQLite so the WAL is flushed into the db file.

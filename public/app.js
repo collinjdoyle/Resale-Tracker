@@ -1,7 +1,7 @@
 // Resale Tracker front-end: vanilla JS, no build step.
 const $ = (s, el = document) => el.querySelector(s);
 const view = $('#view');
-let CUR = '$', AI = false, FEES = {}, tab = 'home', stockFilter = 'all';
+let CUR = '$', AI = false, STALE = 60, FEES = {}, tab = 'home', stockFilter = 'all';
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const money = n => `${n < 0 ? '-' : ''}${CUR}${Math.abs(Number(n) || 0).toFixed(2)}`;
@@ -79,7 +79,11 @@ const thumb = i => `<div class="thumb" style="${i.photos?.[0] ? `background-imag
 
 function itemRow(i, extra = '') {
   const right = i.status === 'sold' ? signed(i.profit) : money(i.cost);
-  const sub = i.status === 'sold' ? `Sold ${esc(i.sold_date)} · ${esc(FEES[i.platform]?.label || i.platform)}` : `${esc(i.brand || '')} ${i.listed_on ? '· ' + esc(i.listed_on) : ''}`;
+  const stale = i.status !== 'sold' && i.days_held >= STALE;
+  const age = i.status === 'sold' ? `sold in ${i.days_held}d` : `<span class="${stale ? 'stale' : ''}">${i.days_held}d in stock</span>`;
+  const sub = i.status === 'sold'
+    ? `Sold ${esc(i.sold_date)} · ${esc(FEES[i.platform]?.label || i.platform)} · ${age}`
+    : `${esc(i.brand || '')} ${i.listed_on ? '· ' + esc(i.listed_on) : ''} · ${age}${i.list_price != null ? ` · asking ${money(i.list_price)}` : ''}`;
   return `<div class="card item" data-id="${i.id}">${thumb(i)}<div class="info"><div class="t">${esc(i.title)}</div><div class="muted">${sub}</div></div><div class="right">${right}${extra}</div></div>`;
 }
 const bindItemRows = (root, fn) => root.querySelectorAll('.item[data-id]').forEach(el => (el.onclick = () => fn(Number(el.dataset.id))));
@@ -97,28 +101,106 @@ function go(t) {
 async function renderHome() {
   const s = await api('/stats');
   const t = s.totals;
-  const plat = s.byPlatform.map(p => `<div class="row" style="margin:6px 0"><span>${esc(FEES[p.platform]?.label || p.platform)} <span class="muted">(${p.count})</span></span><span style="text-align:right">${signed(p.profit)}</span></div>`).join('') || '<div class="muted">No sales yet</div>';
-  const months = s.byMonth.map(m => `<div class="row" style="margin:6px 0"><span>${esc(m.month)} <span class="muted">(${m.count} sold)</span></span><span style="text-align:right">${signed(m.profit)}</span></div>`).join('') || '<div class="muted">No sales yet</div>';
+  const line = (l, r) => `<div class="row" style="margin:6px 0"><span>${l}</span><span style="text-align:right">${r}</span></div>`;
+  const plat = s.byPlatform.map(p => line(`${esc(FEES[p.platform]?.label || p.platform)} <span class="muted">(${p.count})</span>`, signed(p.profit))).join('') || '<div class="muted">No sales yet</div>';
+  const src = s.bySource.map(p => line(`${esc(p.source)} <span class="muted">(${p.count})</span>`, signed(p.profit))).join('') || '<div class="muted">No sales yet</div>';
+
+  // Monthly bar chart (oldest -> newest), profit after that month's expenses.
+  const series = [...s.byMonth].reverse().map(m => ({ month: m.month, net: m.profit - m.expenses }));
+  const peak = Math.max(1, ...series.map(m => Math.abs(m.net)));
+  const chart = series.length ? `<div class="bars">${series.map(m => `<div class="bar-col"><div class="bar-val">${m.net >= 100 ? Math.round(m.net) : m.net.toFixed(0)}</div><div class="bar ${m.net < 0 ? 'neg' : ''}" style="height:${Math.max(4, Math.abs(m.net) / peak * 100)}px"></div><div class="bar-label">${esc(m.month.slice(5))}</div></div>`).join('')}</div>` : '<div class="muted">Your monthly chart will appear after your first sale</div>';
+
+  const g = s.thisMonth;
+  const goal = g.goal > 0
+    ? `<div class="row" style="align-items:baseline"><b>${money(g.profit)} <span class="muted">of ${money(g.goal)} this month</span></b><button class="btn alt sm" id="goal-btn" style="flex:none">Edit</button></div>
+       <div class="progress"><div style="width:${Math.max(0, Math.min(100, g.profit / g.goal * 100))}%"></div></div>
+       <div class="muted">${g.profit >= g.goal ? 'Goal reached — amazing! 🎉' : `${money(g.goal - g.profit)} to go`}</div>`
+    : `<div class="row" style="align-items:center"><span class="muted">Set a monthly profit goal to track your progress</span><button class="btn alt sm" id="goal-btn" style="flex:none">Set goal</button></div>`;
+
   const hr = new Date().getHours();
   const hi = hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening';
   view.innerHTML = `
-    <div class="hero"><div class="hi">${hi}, Ashley 💖</div><div class="big">${money(t.profit)}</div><div class="sub">total profit · ${t.sold_count} item${t.sold_count === 1 ? '' : 's'} sold</div></div>
+    <div class="hero"><div class="hi">${hi}, Ashley 💖</div><div class="big">${money(t.net)}</div>
+      <div class="sub">profit after expenses · ${t.sold_count} item${t.sold_count === 1 ? '' : 's'} sold</div>
+      ${t.expenses ? `<div class="sub">${money(t.profit)} from sales − ${money(t.expenses)} expenses</div>` : ''}</div>
+    <div class="card">${goal}</div>
     <div class="stats">
       <div class="card stat"><span class="ico">💰</span><span class="muted">Revenue</span><b>${money(t.revenue)}</b></div>
       <div class="card stat"><span class="ico">📦</span><span class="muted">In stock</span><b>${s.stock.count}</b><span class="muted">${money(s.stock.cost)} at cost</span></div>
-      <div class="card stat"><span class="ico">🧾</span><span class="muted">Fees paid</span><b>${money(t.fees)}</b></div>
-      <div class="card stat"><span class="ico">🚚</span><span class="muted">Shipping</span><b>${money(t.shipping)}</b></div>
+      <div class="card stat"><span class="ico">✨</span><span class="muted">Avg profit / item</span><b>${money(t.avg_profit)}</b><span class="muted">${t.margin.toFixed(0)}% margin</span></div>
+      <div class="card stat"><span class="ico">⏱️</span><span class="muted">Avg time to sell</span><b>${t.sold_count ? Math.round(t.avg_days) + ' days' : '—'}</b>${s.stale ? `<span class="muted">${s.stale} unsold ${STALE}d+</span>` : ''}</div>
     </div>
+    <h2>Profit by month</h2><div class="card">${chart}</div>
     <div class="two-col">
       <div><h2>By platform</h2><div class="card">${plat}</div></div>
-      <div><h2>By month</h2><div class="card">${months}</div></div>
+      <div><h2>Best places to buy</h2><div class="card">${src}</div></div>
+    </div>
+    <h2>Expenses &amp; mileage</h2>
+    <div class="card">
+      <div class="muted" style="margin-bottom:10px">${money(t.expenses)} logged · ${Math.round(t.miles)} miles driven</div>
+      <button class="btn sm" id="exp-add">＋ Add expense</button>
+      <button class="btn alt sm" id="exp-list" style="margin-left:8px">View all</button>
     </div>
     <h2>Settings</h2>
     <div class="card">
       <button class="btn alt sm" id="fees-btn">Edit fee presets</button>
-      <a class="btn alt sm" style="margin-left:8px" href="/api/export.csv">Export CSV</a>
+      <a class="btn alt sm" style="margin-left:8px" href="/api/export.csv">Export sales CSV</a>
+      <a class="btn alt sm" style="margin-left:8px" href="/api/expenses.csv">Export expenses CSV</a>
     </div>`;
   $('#fees-btn').onclick = editFees;
+  $('#goal-btn').onclick = editGoal;
+  $('#exp-add').onclick = () => openExpense();
+  $('#exp-list').onclick = openExpenseList;
+}
+
+async function editGoal() {
+  const cur = (await api('/settings')).goal;
+  openSheet(`<h1>Monthly goal</h1><div class="muted">Profit after expenses you'd like to make each month. Use 0 to hide the bar.</div>
+    <form id="gf"><label>Goal (${esc(CUR)})</label><input name="goal" type="number" step="1" inputmode="numeric" value="${cur || ''}" autofocus><button class="btn" type="submit">Save</button></form>`);
+  $('#gf').onsubmit = async e => { e.preventDefault(); await api('/settings', { method: 'PUT', body: { goal: Number(e.target.goal.value) || 0 } }); closeSheet(); refresh(); };
+}
+
+const EXPENSE_CATEGORIES = ['Mileage', 'Shipping supplies', 'Platform / booth fees', 'Gas', 'Cleaning / repair', 'Other'];
+
+async function openExpense() {
+  const rate = (await api('/settings')).mileage_rate;
+  openSheet(`<h1>Add expense</h1>
+    <form id="ef">
+      <label>What kind?</label><select name="category">${opt(EXPENSE_CATEGORIES, 'Mileage')}</select>
+      <div id="miles-box"><label>Miles driven</label><input name="miles" type="number" step="0.1" inputmode="decimal">
+        <div class="muted" style="margin-top:4px">Counted at ${esc(CUR)}${rate}/mile <button type="button" class="chip" id="rate-edit" style="padding:2px 10px">change</button> <span id="miles-amt"></span></div></div>
+      <div id="amt-box" hidden><label>Amount (${esc(CUR)})</label><input name="amount" type="number" step="0.01" inputmode="decimal"></div>
+      <div class="row"><div><label>Date</label><input name="date" type="date" value="${today()}"></div><div><label>Note</label><input name="note" placeholder="Goodwill run…"></div></div>
+      <button class="btn" type="submit">Save</button>
+    </form><button class="btn alt" id="cancel">Cancel</button>`);
+  const f = $('#ef');
+  const sync = () => {
+    const mileage = f.category.value === 'Mileage';
+    $('#miles-box').hidden = !mileage; $('#amt-box').hidden = mileage;
+    $('#miles-amt').textContent = mileage && f.miles.value ? `= ${money(f.miles.value * rate)}` : '';
+  };
+  f.category.onchange = f.miles.oninput = sync; sync();
+  $('#rate-edit').onclick = async () => {
+    const v = prompt('Mileage rate per mile (e.g. the current IRS rate)', rate);
+    if (v !== null && Number(v) >= 0) { await api('/settings', { method: 'PUT', body: { mileage_rate: Number(v) } }); openExpense(); }
+  };
+  $('#cancel').onclick = closeSheet;
+  f.onsubmit = async e => {
+    e.preventDefault();
+    const mileage = f.category.value === 'Mileage';
+    const amount = mileage ? Number(f.miles.value) * rate : Number(f.amount.value);
+    if (!(amount > 0)) return toast('Enter an amount or miles');
+    await api('/expenses', { body: { category: f.category.value, amount: amount.toFixed(2), miles: mileage ? f.miles.value : null, date: f.date.value, note: f.note.value } });
+    closeSheet(); toast('Expense saved'); refresh();
+  };
+}
+
+async function openExpenseList() {
+  const list = await api('/expenses');
+  openSheet(`<h1>Expenses</h1>${list.map(e => `<div class="card row" style="align-items:center"><div><b>${esc(e.category)}</b> <span class="muted">${esc(e.date)}</span><div class="muted">${e.miles ? esc(e.miles) + ' mi · ' : ''}${esc(e.note)}</div></div><div style="flex:none;text-align:right"><b>${money(e.amount)}</b><br><button class="chip" data-x="${e.id}" style="padding:2px 10px;color:var(--bad)">delete</button></div></div>`).join('') || '<div class="card empty"><span class="em">🧾</span>No expenses yet</div>'}
+    <button class="btn alt" id="close">Close</button>`);
+  $('#close').onclick = closeSheet;
+  document.querySelectorAll('#sheet-body [data-x]').forEach(b => (b.onclick = async () => { if (confirm('Delete this expense?')) { await api('/expenses/' + b.dataset.x, { method: 'DELETE' }); openExpenseList(); refresh(); } }));
 }
 
 function editFees() {
@@ -138,11 +220,12 @@ function editFees() {
 async function renderStock() {
   view.innerHTML = `<h1>Stock</h1>
     <input id="q" type="search" placeholder="Search title, brand, UPC…" style="margin-bottom:10px">
-    <div class="chips">${[['all', 'Unsold'], ['in_stock', 'Not listed'], ['listed', 'Listed']].map(([k, l]) => `<button class="chip ${stockFilter === k ? 'on' : ''}" data-f="${k}">${l}</button>`).join('')}</div>
+    <div class="chips">${[['all', 'Unsold'], ['in_stock', 'Not listed'], ['listed', 'Listed'], ['stale', `Stale ${STALE}d+`]].map(([k, l]) => `<button class="chip ${stockFilter === k ? 'on' : ''}" data-f="${k}">${l}</button>`).join('')}</div>
     <div id="list"></div>`;
   const draw = async () => {
     const all = await api('/items?q=' + encodeURIComponent($('#q').value));
-    const items = all.filter(i => i.status !== 'sold' && (stockFilter === 'all' || i.status === stockFilter));
+    let items = all.filter(i => i.status !== 'sold' && (stockFilter === 'all' || stockFilter === 'stale' || i.status === stockFilter));
+    if (stockFilter === 'stale') items = items.filter(i => i.days_held >= STALE).sort((a, b) => b.days_held - a.days_held);
     $('#list').innerHTML = items.map(i => itemRow(i, i.status === 'listed' ? '<div><span class="badge">listed</span></div>' : '')).join('') || '<div class="card empty"><span class="em">🛍️</span>Nothing here yet — tap + to add your first find!</div>';
     bindItemRows($('#list'), openItem);
   };
@@ -169,10 +252,24 @@ async function openItem(id) {
       ? `<button class="btn alt" id="edit-sale">Edit sale</button><button class="btn alt" id="unsell">Mark as unsold</button>`
       : `<button class="btn" id="sell">Mark as sold</button>
          <button class="btn alt" id="toggle-list">${i.status === 'listed' ? 'Mark as not listed' : 'Mark as listed'}</button>`}
+    ${AI ? `<div class="card" style="margin-top:14px"><b>✨ Listing writer</b> <span class="muted">(uses the saved details + first photo)</span>
+      <div class="row" style="margin-top:8px"><select id="lp">${[['ebay', 'eBay'], ['vinted', 'Vinted'], ['facebook', 'Facebook'], ['amazon', 'Amazon']].map(([k, l]) => `<option value="${k}">${l}</option>`).join('')}</select><button class="btn sm" id="gen" style="flex:none">Write it</button></div>
+      <div id="listing"></div></div>` : ''}
     <button class="btn danger" id="del">Delete item</button>
     <button class="btn alt" id="close">Close</button>`);
 
   $('#close').onclick = closeSheet;
+  if (AI) $('#gen').onclick = async () => {
+    const out = $('#listing'), btn = $('#gen');
+    btn.disabled = true; out.innerHTML = '<div class="banner">Writing… (a local model can take a little while)</div>';
+    try {
+      const r = await api(`/items/${id}/listing`, { body: { platform: $('#lp').value } });
+      out.innerHTML = `<label>Title</label><input id="lt" value="${esc(r.title)}"><button class="btn alt sm" data-copy="lt" style="margin-top:6px">Copy title</button>
+        <label>Description</label><textarea id="ld" rows="7">${esc(r.description)}</textarea><button class="btn alt sm" data-copy="ld" style="margin-top:6px">Copy description</button>`;
+      out.querySelectorAll('[data-copy]').forEach(b => (b.onclick = async () => { try { await navigator.clipboard.writeText($('#' + b.dataset.copy).value); toast('Copied'); } catch { $('#' + b.dataset.copy).select(); toast('Press copy on your keyboard'); } }));
+    } catch (err) { out.innerHTML = `<div class="banner">${esc(err.message)}</div>`; }
+    btn.disabled = false;
+  };
   $('#f').onsubmit = async e => { e.preventDefault(); await api('/items/' + id, { method: 'PUT', body: formData(e.target) }); toast('Saved'); refresh(); closeSheet(); };
   $('#del').onclick = async () => { if (confirm('Delete this item and its photos?')) { await api('/items/' + id, { method: 'DELETE' }); closeSheet(); refresh(); } };
   $('#more-photo').onchange = async e => { const f = e.target.files[0]; if (!f) return; await api(`/items/${id}/photos`, { body: await shrink(f) }); openItem(id); refresh(); };
@@ -194,7 +291,8 @@ function itemFields(i = {}) {
     <label>UPC / barcode</label><div class="row"><input name="upc" inputmode="numeric" value="${esc(i.upc)}" style="flex:3"><button type="button" class="btn alt sm" id="upc-go" style="flex:1">Look up</button></div>
     <div class="row"><div><label>Paid (${esc(CUR)})</label><input name="cost" type="number" step="0.01" inputmode="decimal" value="${i.cost ?? ''}" required></div><div><label>Date bought</label><input name="bought_date" type="date" value="${esc(i.bought_date || today())}"></div></div>
     <label>Bought from</label><input name="bought_from" value="${esc(i.bought_from)}" placeholder="Thrift store, garage sale, FB…">
-    <label>Listed on</label><input name="listed_on" value="${esc(i.listed_on)}" placeholder="eBay, Vinted…">
+    <div class="row"><div><label>Listed on</label><input name="listed_on" value="${esc(i.listed_on)}" placeholder="eBay, Vinted…"></div>
+    <div><label>Asking price (${esc(CUR)})</label><input name="list_price" type="number" step="0.01" inputmode="decimal" value="${i.list_price ?? ''}"></div></div>
     <label>Notes</label><textarea name="notes" rows="2">${esc(i.notes)}</textarea>`;
 }
 const formData = form => Object.fromEntries(new FormData(form));
@@ -354,7 +452,7 @@ function showLogin() {
 
 (async () => {
   const s = await fetch('/api/session').then(r => r.json());
-  CUR = s.currency; AI = s.ai;
+  CUR = s.currency; AI = s.ai; STALE = s.staleDays || 60;
   if (!s.authed) return showLogin();
   FEES = await api('/fees');
   go('home');
