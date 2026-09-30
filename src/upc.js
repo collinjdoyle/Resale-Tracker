@@ -27,14 +27,17 @@ async function upcItemDb(code) {
   const r = await get(key ? `https://api.upcitemdb.com/prod/v1/lookup?upc=${code}` : `https://api.upcitemdb.com/prod/trial/lookup?upc=${code}`,
     key ? { user_key: key, key_type: '3scale' } : {});
   if (r.status === 429) return { limited: true };
-  if (!r.ok) return { product: null, unsure: true };
+  if (r.status === 404) return { product: null }; // "not found" is an answer, not a failure
+  if (r.status === 400) return { invalid: true };   // UPCitemdb rejects numbers whose check digit is wrong
+  if (!r.ok) return { product: null, unsure: true, status: r.status };
   const p = (await r.json()).items?.[0];
   return p ? { product: { source: 'upcitemdb', title: p.title || '', brand: p.brand || '', category: (p.category || '').split('>').pop().trim(), description: p.description || '' } } : { product: null };
 }
 
 async function openFacts(host, code) {
   const r = await get(`https://${host}/api/v2/product/${code}.json?fields=product_name,brands,categories`);
-  if (!r.ok) return { product: null, unsure: true };
+  if (r.status === 404) return { product: null }; // Open*Facts answers "product not found" with a 404
+  if (!r.ok) return { product: null, unsure: true, status: r.status };
   const j = await r.json();
   if (j.status !== 1 || !j.product?.product_name) return { product: null };
   return { product: { source: host.split('.')[1], title: j.product.product_name, brand: (j.product.brands || '').split(',')[0].trim(), category: (j.product.categories || '').split(',')[0].trim(), description: '' } };
@@ -47,17 +50,19 @@ export async function lookupUpc(code) {
   const hit = cached(code);
   if (hit !== undefined) return { product: hit };
 
-  let limited = false, unsure = false;
-  for (const source of [() => upcItemDb(code), () => openFacts('world.openproductsfacts.org', code), () => openFacts('world.openfoodfacts.org', code)]) {
+  let limited = false;
+  const why = []; // why each source failed, shown to the user so a network problem is diagnosable
+  for (const [name, source] of [['UPCitemdb', () => upcItemDb(code)], ['OpenProductsFacts', () => openFacts('world.openproductsfacts.org', code)], ['OpenFoodFacts', () => openFacts('world.openfoodfacts.org', code)]]) {
     try {
       const r = await source();
+      if (r.invalid) return { product: null, note: `${code} isn't a valid barcode number (a digit is wrong). Re-scan it, or check what you typed.` };
       if (r.limited) { limited = true; continue; }
-      if (r.unsure) unsure = true;
+      if (r.unsure) why.push(`${name}: HTTP ${r.status}`);
       if (r.product) { const product = { ...r.product, upc: code }; remember(code, product); return { product }; }
-    } catch { unsure = true; }
+    } catch (e) { why.push(`${name}: ${e.cause?.code || e.cause?.message || e.message}`); }
   }
   if (limited) return { product: null, note: 'Barcode lookup limit reached for today — type the details in, or try again tomorrow.' };
-  if (unsure) return { product: null, note: "Couldn't reach the barcode databases — check the server's internet connection." };
+  if (why.length) return { product: null, note: `Couldn't reach the barcode databases from the server (${why.join('; ')}). Check the Unraid server's internet/DNS.` };
   remember(code, null); // every source answered "not found"
   return { product: null };
 }

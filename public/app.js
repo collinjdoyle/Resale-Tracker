@@ -68,29 +68,41 @@ async function quagga(src, size, passes = QUAGGA_PASSES.length) {
   return null;
 }
 
-async function barcodeFromImage(source) { // source: File/Blob (full-resolution photo works best)
+// Phone photos are ~12 megapixels: decoding them whole is slow and can run a phone out of memory, so decode a
+// 1600px copy (EXIF rotation applied) instead.
+async function barcodeFromImage(source) { // source: File/Blob
   try {
-    if (detector) { const f = await detector.detect(await createImageBitmap(source)); if (f[0]) return f[0].rawValue; }
-    const url = URL.createObjectURL(source);
-    try { return (await quagga(url, 1600)) || (await quagga(url, 900)); } finally { URL.revokeObjectURL(url); }
-  } catch { return null; }
+    const bmp = await createImageBitmap(source, { imageOrientation: 'from-image' });
+    const k = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    bmp.close?.();
+    if (detector) { const f = await detector.detect(c); if (f[0]) return f[0].rawValue; }
+    const url = c.toDataURL('image/jpeg', 0.92);
+    return (await quagga(url, 1600)) || (await quagga(url, 1000));
+  } catch (err) { console.error('barcode read failed', err); return null; }
 }
 
 // Over plain HTTP the browser blocks live camera access, so "scan" opens the phone's camera app for a
 // photo of the barcode instead and reads the barcode from that picture.
 function scanFromPhoto() {
   return new Promise(resolve => {
+    const status = html => { const el = $('#status') || $('#banner'); if (el) el.innerHTML = html ? `<div class="banner">${html}</div>` : ''; };
     const input = document.createElement('input');
     input.type = 'file'; input.accept = 'image/*'; input.setAttribute('capture', 'environment');
+    input.style.display = 'none';
+    document.body.append(input); // iPhone Safari can drop a detached file input before its change event fires
+    const done = v => { input.remove(); resolve(v); };
     input.onchange = async () => {
       const file = input.files[0];
-      if (!file) return resolve(null);
-      toast('Reading barcode…');
+      if (!file) return done(null);
+      status('Reading barcode from your photo…');
       const code = await barcodeFromImage(file);
-      if (!code) toast("Couldn't read it — get closer, hold steady, keep the barcode flat and well lit");
-      resolve(code);
+      status(code ? '' : "Couldn't find a barcode in that photo. Get close so the bars fill the frame, hold steady, keep it flat and well lit — or type the number in.");
+      done(code);
     };
-    input.addEventListener('cancel', () => resolve(null));
+    input.addEventListener('cancel', () => done(null));
     input.click();
   });
 }
