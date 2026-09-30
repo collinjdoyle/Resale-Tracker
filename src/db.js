@@ -36,8 +36,7 @@ CREATE INDEX IF NOT EXISTS idx_items_upc ON items(upc);
 CREATE TABLE IF NOT EXISTS photos (
   id       INTEGER PRIMARY KEY AUTOINCREMENT,
   item_id  INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-  filename TEXT NOT NULL,
-  hash     TEXT
+  filename TEXT NOT NULL
 );
 
 -- One row per sale event. sold_price is per unit; fees and shipping are for the whole sale.
@@ -70,7 +69,6 @@ CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
 const cols = t => db.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
 if (!cols('items').includes('list_price')) db.exec('ALTER TABLE items ADD COLUMN list_price REAL');
 if (!cols('items').includes('quantity')) db.exec('ALTER TABLE items ADD COLUMN quantity INTEGER NOT NULL DEFAULT 1');
-if (!cols('photos').includes('hash')) db.exec('ALTER TABLE photos ADD COLUMN hash TEXT');
 if (!cols('sales').includes('qty')) {
   // Old sales table had UNIQUE(item_id) (one sale per item); rebuild without it, every old sale becomes qty 1.
   db.exec('PRAGMA foreign_keys = OFF');

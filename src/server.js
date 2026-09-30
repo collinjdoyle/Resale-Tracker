@@ -7,9 +7,7 @@ import {
   db, UPLOAD_DIR, STALE_DAYS, listItems, getItem, stats, getFees, setFees, getSetting, setSetting,
   listExpenses, addExpense, deleteExpense, listSales, getSale, soldQty, recalcStatus,
 } from './db.js';
-import { identify, writeListing, findMatches, aiEnabled } from './ai.js';
 import { lookupUpc } from './upc.js';
-import { rank, HASH_RE } from './similar.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 const PASSWORD = process.env.APP_PASSWORD || '';
@@ -39,7 +37,7 @@ app.post('/api/login', (req, res) => {
   res.setHeader('Set-Cookie', `auth=${token()}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${60 * 60 * 24 * 365}`);
   res.json({ ok: true });
 });
-app.get('/api/session', (req, res) => res.json({ authed: authed(req), currency: CURRENCY, ai: aiEnabled(), passwordRequired: !!PASSWORD, staleDays: STALE_DAYS }));
+app.get('/api/session', (req, res) => res.json({ authed: authed(req), currency: CURRENCY, passwordRequired: !!PASSWORD, staleDays: STALE_DAYS }));
 
 app.use(['/api', '/uploads'], (req, res, next) => authed(req) ? next() : res.status(401).json({ error: 'Login required' }));
 app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '30d', immutable: true }));
@@ -89,11 +87,11 @@ app.post('/api/items', wrap(req => {
   const id = Number(r.lastInsertRowid);
   // "Add again" from history: reuse the old item's photos (copied, so deleting either item keeps the other's pictures).
   if (b.copy_photos_from) {
-    for (const p of db.prepare('SELECT filename, hash FROM photos WHERE item_id=? ORDER BY id').all(Number(b.copy_photos_from))) {
+    for (const p of db.prepare('SELECT filename FROM photos WHERE item_id=? ORDER BY id').all(Number(b.copy_photos_from))) {
       const ext = path.extname(p.filename);
       const filename = `${crypto.randomUUID()}${ext}`;
       try { fs.copyFileSync(path.join(UPLOAD_DIR, p.filename), path.join(UPLOAD_DIR, filename)); } catch { continue; }
-      db.prepare('INSERT INTO photos (item_id, filename, hash) VALUES (?,?,?)').run(id, filename, p.hash);
+      db.prepare('INSERT INTO photos (item_id, filename) VALUES (?,?)').run(id, filename);
     }
   }
   return getItem(id);
@@ -145,8 +143,7 @@ app.post('/api/items/:id/photos', wrap(req => {
   const id = Number(req.params.id);
   if (!getItem(id)) throw fail(404, 'Not found');
   const filename = savePhoto(imageBody(req));
-  const hash = String(req.headers['x-image-hash'] || '');
-  db.prepare('INSERT INTO photos (item_id, filename, hash) VALUES (?,?,?)').run(id, filename, HASH_RE.test(hash) ? hash : null);
+  db.prepare('INSERT INTO photos (item_id, filename) VALUES (?,?)').run(id, filename);
   return getItem(id);
 }));
 
@@ -157,16 +154,6 @@ app.delete('/api/photos/:id', (req, res) => {
     fs.rmSync(path.join(UPLOAD_DIR, p.filename), { force: true });
   }
   res.json({ ok: true });
-});
-
-// "Looks like" search: client sends a fingerprint of the photo it just took; we return the closest items.
-app.post('/api/similar', (req, res) => {
-  const hash = String(req.body?.hash || '');
-  if (!HASH_RE.test(hash)) return res.status(400).json({ error: 'Bad image fingerprint' });
-  const photos = db.prepare('SELECT item_id, hash FROM photos WHERE hash IS NOT NULL').all();
-  let ranked = rank(hash, photos, 30).map(r => ({ item: getItem(r.item_id), score: r.score })).filter(r => r.item);
-  if (req.body.unsold) ranked = ranked.filter(r => r.item.remaining > 0);
-  res.json({ photosIndexed: photos.length, matches: ranked.slice(0, 6).map(r => ({ ...r.item, score: Math.round(r.score * 100) / 100 })) });
 });
 
 // ---------- sales (one row per sale event; an item can be sold in several pieces) ----------
@@ -220,26 +207,6 @@ app.get('/api/upc/:code', wrap(async req => {
   return { ...(await lookupUpc(code)), existing };
 }));
 
-// Optional AI helpers (only when AI_PROVIDER is set up)
-app.post('/api/identify', wrap(async req => {
-  const ai = await identify(imageBody(req), req.headers['content-type'].split(';')[0]);
-  const matches = findMatches(ai, listItems()).map(m => ({ ...m.item, score: Math.round(m.score * 100) / 100 }));
-  const upcProduct = ai.upc ? (await lookupUpc(ai.upc)).product : null;
-  return { ai, upcProduct, matches };
-}));
-
-app.post('/api/items/:id/listing', wrap(async req => {
-  const item = getItem(Number(req.params.id));
-  if (!item) throw fail(404, 'Not found');
-  let photo = null;
-  const first = db.prepare('SELECT filename FROM photos WHERE item_id=? ORDER BY id LIMIT 1').get(item.id);
-  if (first) {
-    const file = path.join(UPLOAD_DIR, first.filename);
-    photo = { buf: fs.readFileSync(file), mime: file.endsWith('.png') ? 'image/png' : file.endsWith('.webp') ? 'image/webp' : 'image/jpeg' };
-  }
-  return writeListing(item, String(req.body?.platform || 'ebay'), photo);
-}));
-
 // ---------- expenses & settings ----------
 app.get('/api/expenses', (_req, res) => res.json(listExpenses()));
 app.post('/api/expenses', (req, res) => {
@@ -278,7 +245,7 @@ app.get('/api/sales.csv', (_req, res) => sendCsv(res, 'sales-export.csv',
 app.get('/api/expenses.csv', (_req, res) => sendCsv(res, 'expenses-export.csv', ['date', 'category', 'amount', 'miles', 'note'], listExpenses()));
 
 // Container stop/update sends SIGTERM: finish requests and close SQLite so the WAL is flushed into the db file.
-const server = app.listen(PORT, () => console.log(`resale-tracker listening on :${PORT} (AI: ${aiEnabled() ? process.env.AI_PROVIDER : 'off'}, auth: ${PASSWORD ? 'on' : 'off'})`));
+const server = app.listen(PORT, () => console.log(`resale-tracker listening on :${PORT} (auth: ${PASSWORD ? 'on' : 'off'})`));
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, () => server.close(() => { try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); db.close(); } catch { /* already closed */ } process.exit(0); }));
 }

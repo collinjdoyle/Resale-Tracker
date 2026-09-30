@@ -1,7 +1,7 @@
 // Resale Tracker front-end: vanilla JS, no build step.
 const $ = (s, el = document) => el.querySelector(s);
 const view = $('#view');
-let CUR = '$', AI = false, STALE = 60, FEES = {}, tab = 'home', stockFilter = 'all', prefill = null;
+let CUR = '$', STALE = 60, FEES = {}, tab = 'home', stockFilter = 'all', prefill = null;
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const money = n => `${n < 0 ? '-' : ''}${CUR}${Math.abs(Number(n) || 0).toFixed(2)}`;
@@ -33,7 +33,7 @@ const openSheet = html => { $('#sheet-body').innerHTML = html; $('#sheet').hidde
 const closeSheet = () => { $('#sheet').hidden = true; $('#sheet-body').innerHTML = ''; };
 $('#sheet').addEventListener('click', e => { if (e.target.id === 'sheet') closeSheet(); });
 
-// ---------- photos: downscale, fingerprint, barcode ----------
+// ---------- photos: downscale, barcode ----------
 // Phone photos are huge; 1280px is plenty for reference pictures.
 async function shrink(file, max = 1280) {
   const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
@@ -43,28 +43,6 @@ async function shrink(file, max = 1280) {
   c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
   bmp.close?.();
   return new Promise(res => c.toBlob(res, 'image/jpeg', 0.85));
-}
-
-// Tiny image fingerprint for "looks like" matching (see server src/similar.js): 256-bit dHash + 64-bin colour histogram.
-async function fingerprint(blob) {
-  const bmp = await createImageBitmap(blob);
-  const cw = bmp.width * 0.8, ch = bmp.height * 0.8, cx = (bmp.width - cw) / 2, cy = (bmp.height - ch) / 2; // centre crop: ignore edges/background
-  const draw = (w, h) => {
-    const c = document.createElement('canvas'); c.width = w; c.height = h;
-    const g = c.getContext('2d', { willReadFrequently: true });
-    g.drawImage(bmp, cx, cy, cw, ch, 0, 0, w, h);
-    return g.getImageData(0, 0, w, h).data;
-  };
-  const px = draw(17, 16), gray = i => px[i * 4] * 0.299 + px[i * 4 + 1] * 0.587 + px[i * 4 + 2] * 0.114;
-  const bytes = new Uint8Array(32);
-  for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
-    if (gray(y * 17 + x) > gray(y * 17 + x + 1)) bytes[(y * 16 + x) >> 3] |= 1 << ((y * 16 + x) & 7);
-  }
-  const big = draw(32, 32), bins = new Array(64).fill(0);
-  for (let i = 0; i < 1024; i++) bins[(big[i * 4] >> 6) * 16 + (big[i * 4 + 1] >> 6) * 4 + (big[i * 4 + 2] >> 6)]++;
-  bmp.close?.();
-  const hex = b => b.toString(16).padStart(2, '0');
-  return [...bytes].map(hex).join('') + bins.map(n => hex(Math.min(255, Math.round(n / 1024 * 255)))).join('');
 }
 
 const BARCODE_FORMATS = ['ean_13', 'ean_8', 'upc_a', 'upc_e'];
@@ -343,9 +321,6 @@ async function openItem(id) {
     ${open ? `<button class="btn" id="sell">Mark sold</button>
               <button class="btn alt" id="toggle-list">${i.status === 'listed' ? 'Mark as not listed' : 'Mark as listed'}</button>` : ''}
     <button class="btn alt" id="again">🔁 Add again (bought more)</button>
-    ${AI ? `<div class="card" style="margin-top:14px"><b>✨ Listing writer</b>
-      <div class="row" style="margin-top:8px"><select id="lp">${[['ebay', 'eBay'], ['vinted', 'Vinted'], ['facebook', 'Facebook'], ['amazon', 'Amazon']].map(([k, l]) => `<option value="${k}">${l}</option>`).join('')}</select><button class="btn sm" id="gen" style="flex:none">Write it</button></div>
-      <div id="listing"></div></div>` : ''}
     <button class="btn danger" id="del">Delete item</button>
     <button class="btn alt" id="close">Close</button>`);
 
@@ -358,24 +333,13 @@ async function openItem(id) {
   };
   $('#del').onclick = async () => { if (confirm('Delete this item, its photos and its sales history?')) { await api('/items/' + id, { method: 'DELETE' }); closeSheet(); refresh(); } };
   $('#again').onclick = () => { closeSheet(); addFromItem(i); };
-  $('#more-photo').onchange = async e => { const f = e.target.files[0]; if (!f) return; const blob = await shrink(f); await api(`/items/${id}/photos`, { body: blob, headers: { 'x-image-hash': await fingerprint(blob) } }); openItem(id); refresh(); };
+  $('#more-photo').onchange = async e => { const f = e.target.files[0]; if (!f) return; const blob = await shrink(f); await api(`/items/${id}/photos`, { body: blob }); openItem(id); refresh(); };
   document.querySelectorAll('#photos .x').forEach(b => (b.onclick = async () => { await api('/photos/' + b.dataset.p, { method: 'DELETE' }); openItem(id); refresh(); }));
   document.querySelectorAll('.sale-row').forEach(r => (r.onclick = () => openSell(i, i.sales.find(s => s.id === Number(r.dataset.sale)))));
   if (open) {
     $('#sell').onclick = () => openSell(i);
     $('#toggle-list').onclick = async () => { await api('/items/' + id, { method: 'PUT', body: { status: i.status === 'listed' ? 'in_stock' : 'listed' } }); closeSheet(); refresh(); };
   }
-  if (AI) $('#gen').onclick = async () => {
-    const out = $('#listing'), btn = $('#gen');
-    btn.disabled = true; out.innerHTML = '<div class="banner">Writing…</div>';
-    try {
-      const r = await api(`/items/${id}/listing`, { body: { platform: $('#lp').value } });
-      out.innerHTML = `<label>Title</label><input id="lt" value="${esc(r.title)}"><button class="btn alt sm" data-copy="lt" style="margin-top:6px">Copy title</button>
-        <label>Description</label><textarea id="ld" rows="7">${esc(r.description)}</textarea><button class="btn alt sm" data-copy="ld" style="margin-top:6px">Copy description</button>`;
-      out.querySelectorAll('[data-copy]').forEach(b => (b.onclick = async () => { try { await navigator.clipboard.writeText($('#' + b.dataset.copy).value); toast('Copied'); } catch { $('#' + b.dataset.copy).select(); toast('Press copy on your keyboard'); } }));
-    } catch (err) { out.innerHTML = `<div class="banner">${esc(err.message)}</div>`; }
-    btn.disabled = false;
-  };
 }
 
 // Start the Add form from an existing/old item ("I bought another one").
@@ -431,15 +395,10 @@ function openSell(i, sale = null) {
   };
 }
 
-// Shows the closest look-alikes for a photo so the user can pick the right one.
-async function similarFor(blob, unsold) {
-  const r = await api('/similar', { body: { hash: await fingerprint(blob), unsold } });
-  return r;
-}
-
 async function renderSell() {
   view.innerHTML = `<h1>Mark an item sold</h1>
-    <div class="big-actions"><input id="q" type="search" placeholder="Search your stock…"><label class="btn alt" id="find-photo">📷 Find by photo<input type="file" accept="image/*" capture="environment" hidden id="findp"></label></div>
+    <input id="q" type="search" placeholder="Search your stock…">
+    <div class="big-actions" style="margin-top:12px"><button class="btn alt" id="scan" type="button">▮▮▮ Scan barcode</button><label class="btn alt">📷 Barcode photo<input type="file" accept="image/*" capture="environment" hidden id="findp"></label></div>
     <div id="banner"></div><div id="list" style="margin-top:12px"></div>`;
   const draw = async (items) => {
     items ??= (await api('/items?q=' + encodeURIComponent($('#q').value))).filter(i => i.status !== 'sold');
@@ -448,19 +407,20 @@ async function renderSell() {
     bindItemRows($('#list'), async id => openSell(await api('/items/' + id)));
   };
   $('#q').oninput = debounce(() => { $('#banner').innerHTML = ''; draw(); }, 200);
+  // Barcode -> the matching unsold item. Exactly one match opens the sale form straight away.
+  const findByCode = async code => {
+    if (!code) { $('#banner').innerHTML = '<div class="banner">Couldn\'t read a barcode — try again, or search by name.</div>'; return; }
+    const hits = (await api('/items?q=' + encodeURIComponent(code.replace(/^0(?=\d{12}$)/, '')))).filter(i => i.status !== 'sold');
+    if (hits.length === 1) return openSell(hits[0]);
+    $('#banner').innerHTML = `<div class="banner">${hits.length ? `Barcode <b>${esc(code)}</b> matches ${hits.length} items — tap the right one:` : `Barcode <b>${esc(code)}</b> isn't in your stock.`}</div>`;
+    draw(hits);
+  };
+  $('#scan').onclick = async () => findByCode(await scanBarcode());
   $('#findp').onchange = async e => {
     const file = e.target.files[0]; if (!file) return;
-    $('#banner').innerHTML = '<div class="banner">Comparing with your photos…</div>';
-    try {
-      const code = await barcodeFromImage(file);
-      if (code) {
-        const hits = (await api('/items?q=' + encodeURIComponent(code.replace(/^0(?=\d{12}$)/, '')))).filter(i => i.status !== 'sold');
-        if (hits.length) { $('#banner').innerHTML = `<div class="banner">Read barcode <b>${esc(code)}</b> — tap the item:</div>`; return draw(hits); }
-      }
-      const r = await similarFor(await shrink(file), true);
-      $('#banner').innerHTML = `<div class="banner">${r.matches.length ? 'Closest matches to your photo — tap the right one:' : r.photosIndexed ? 'Nothing in stock looks similar. Try searching by name.' : 'No item photos to compare with yet.'}</div>`;
-      draw(r.matches);
-    } catch (err) { $('#banner').innerHTML = `<div class="banner">${esc(err.message)}</div>`; }
+    $('#banner').innerHTML = '<div class="banner">Reading barcode…</div>';
+    try { await findByCode(await barcodeFromImage(file)); } catch (err) { $('#banner').innerHTML = `<div class="banner">${esc(err.message)}</div>`; }
+    e.target.value = '';
   };
   draw();
 }
@@ -501,7 +461,7 @@ function renderAdd() {
       <button class="btn alt" id="scan" type="button">▮▮▮ Scan barcode</button>
     </div>
     <button class="btn alt" id="hist" type="button" style="margin-top:12px">🔁 Add something I've had before</button>
-    <div class="muted" style="margin:8px 0">Photo of the item <i>or</i> its barcode. A barcode fills in the details; a photo shows look-alikes you already have, in case it's a repeat.</div>
+    <div class="muted" style="margin:8px 0">Scan the barcode (or take a photo of it) to fill in the details. Photos are saved with the item; if the barcode is read from your photo it's filled in automatically.</div>
     <div id="status">${pre ? `<div class="banner">Adding another <b>${esc(pre.title)}</b> — details copied${pre.photos?.length ? ' (photos too)' : ''}. Enter how many and what you paid.</div>` : ''}</div><div id="matches"></div>
     <form id="f"><div class="photos" id="pending"></div>${itemFields(pre || {})}
       <button class="btn" type="submit">Save item</button>
@@ -534,24 +494,10 @@ function renderAdd() {
 
   async function addPhoto(file) {
     const blob = await shrink(file);
-    const hash = await fingerprint(blob);
-    draft.photos.push({ blob, hash });
+    draft.photos.push({ blob });
     drawPending();
     const code = !form.upc.value ? await barcodeFromImage(file) : null;
     if (code) { form.upc.value = code; toast(`Read barcode ${code}`); return fromBarcode(); }
-    if (draft.photos.length > 1) return;
-    try {
-      const r = await api('/similar', { body: { hash } });
-      showMatches(r.matches.filter(m => m.score >= 0.35), '<b>Looks like something you already have?</b> Closest matches — tap one to open it, or ignore and add this as new.');
-    } catch { /* photo matching is a nice-to-have */ }
-    if (AI) {
-      $('#status').innerHTML = '<div class="banner">Identifying item…</div>';
-      try {
-        const r = await api('/identify', { body: blob });
-        $('#status').innerHTML = `<div class="banner">Guessed: <b>${esc(r.ai.title)}</b> — check the details below.</div>`;
-        fill(r.upcProduct ? { ...r.ai, ...Object.fromEntries(Object.entries(r.upcProduct).filter(([, v]) => v)) } : r.ai);
-      } catch (err) { $('#status').innerHTML = `<div class="banner">Couldn't identify: ${esc(err.message)}</div>`; }
-    }
   }
 
   function drawPending() {
@@ -563,7 +509,7 @@ function renderAdd() {
     const btns = form.querySelectorAll('button'); btns.forEach(b => (b.disabled = true));
     try {
       const item = await api('/items', { body: { ...formData(form), copy_photos_from: draft.copyFrom } });
-      for (const p of draft.photos) await api(`/items/${item.id}/photos`, { body: p.blob, headers: { 'x-image-hash': p.hash } });
+      for (const p of draft.photos) await api(`/items/${item.id}/photos`, { body: p.blob });
       toast(`Added "${item.title.slice(0, 30)}"`);
       again ? renderAdd() : go('stock');
     } catch (err) { toast(err.message); btns.forEach(b => (b.disabled = false)); }
@@ -598,7 +544,7 @@ function showLogin() {
 
 (async () => {
   const s = await fetch('/api/session').then(r => r.json());
-  CUR = s.currency; AI = s.ai; STALE = s.staleDays || 60;
+  CUR = s.currency; STALE = s.staleDays || 60;
   if (!s.authed) return showLogin();
   FEES = await api('/fees');
   go('home');

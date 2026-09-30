@@ -3,10 +3,10 @@
 A small, phone-first web app for tracking resale inventory and profit (Vinted, Facebook Marketplace, eBay, Amazon...).
 
 ## What it does
-- **Add items fast** - scan a barcode (UPC/EAN) or photograph it, and the details are filled in. Photos of the item itself show look-alikes you already have, so repeats are easy to spot.
+- **Add items fast** - scan a barcode (UPC/EAN), or photograph it, and the details are filled in. Photos you take are saved with the item.
 - **Quantity** - buy 6 of something, sell them in pieces; the stock count and profit track it per sale.
 - **Add again / history** - "Add something I've had before" (or "Add again" on any item) copies the details and photos; you only enter how many and what you paid this time.
-- **Mark sold in seconds** - search, or *Find by photo*; enter price, platform, fees (pre-filled from editable presets) and shipping; live profit preview. Every sale is kept in the **Sold** history and can be edited or undone.
+- **Mark sold in seconds** - search, or scan the item's barcode to jump straight to it; enter price, platform, fees (pre-filled from editable presets) and shipping; live profit preview. Every sale is kept in the **Sold** history and can be edited or undone.
 - **Dashboard** - profit after expenses, monthly goal bar, profit-by-month chart, average profit and time to sell, best places to buy, by platform. CSV exports.
 - **Stock health** - days in stock, *Stale 60d+* filter, asking price.
 - **Expenses and mileage** - gas/supplies/fees and miles (editable per-mile rate), subtracted from profit.
@@ -20,9 +20,6 @@ Stack: Node 22 + Express, SQLite (`node:sqlite`, no native deps), vanilla JS. Ev
 3. Open Products Facts, then Open Food Facts (mostly groceries).
 
 Reading the barcode: Chrome/Android uses the built-in detector. iPhone (and everything else) uses a bundled reader (`public/vendor`, Quagga2, MIT) that also works on a *photo* of the barcode. **Live camera scanning needs HTTPS**; *Take photo* works over plain HTTP.
-
-## Photo look-alikes (no AI)
-Each photo gets a tiny fingerprint (shape + colour) computed in the browser. Matching is basic on purpose: it shows the closest few items you already have and you pick the right one. It can't identify a brand-new item - use the barcode for that.
 
 ## Run locally
 ```bash
@@ -38,6 +35,3 @@ node --env-file=.env src/server.js
 5. Update: push, wait for the Action to go green, then pull and Up again.
 
 Back up `/mnt/user/appdata/resale-tracker` (database + photos). Do not expose the app to the internet without HTTPS and a password.
-
-## Optional AI extras
-Off by default. With `AI_PROVIDER=ollama` (or `anthropic`) the Add screen also guesses title/brand from a photo and each item gets a listing-text writer. Needs a vision model (e.g. `qwen2.5vl:3b`); slow on old GPUs. Not needed for normal use.
