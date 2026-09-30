@@ -3,9 +3,13 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { db, UPLOAD_DIR, listItems, getItem, stats, getFees, setFees, getSetting, setSetting, listExpenses, addExpense, deleteExpense, STALE_DAYS } from './db.js';
+import {
+  db, UPLOAD_DIR, STALE_DAYS, listItems, getItem, stats, getFees, setFees, getSetting, setSetting,
+  listExpenses, addExpense, deleteExpense, listSales, getSale, soldQty, recalcStatus,
+} from './db.js';
 import { identify, writeListing, findMatches, aiEnabled } from './ai.js';
 import { lookupUpc } from './upc.js';
+import { rank, HASH_RE } from './similar.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 const PASSWORD = process.env.APP_PASSWORD || '';
@@ -44,17 +48,22 @@ app.use(express.static(PUBLIC));
 // ---------- helpers ----------
 const num = v => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
 const today = () => new Date().toISOString().slice(0, 10);
+const fail = (status, message) => Object.assign(new Error(message), { status });
 const ITEM_FIELDS = ['title', 'brand', 'category', 'condition', 'size', 'upc', 'bought_date', 'bought_from', 'listed_on', 'notes'];
 
 function itemValues(b) {
   const v = {};
   for (const f of ITEM_FIELDS) if (b[f] !== undefined) v[f] = String(b[f] ?? '').trim();
   if (b.cost !== undefined) v.cost = num(b.cost);
+  if (b.quantity !== undefined) v.quantity = Math.max(1, Math.floor(num(b.quantity)) || 1);
   if (b.list_price !== undefined) v.list_price = b.list_price === '' || b.list_price === null ? null : num(b.list_price);
   if (b.status !== undefined && ['in_stock', 'listed', 'sold'].includes(b.status)) v.status = b.status;
-  if (v.upc) v.upc = v.upc.replace(/\D/g, '');
+  if (v.upc) v.upc = normUpc(v.upc);
   return v;
 }
+
+// Scanners read a 12-digit UPC-A as a 13-digit EAN with a leading 0; store one form so history matches either way.
+const normUpc = code => { const d = String(code).replace(/\D/g, ''); return d.length === 13 && d[0] === '0' ? d.slice(1) : d; };
 
 const sniffExt = buf =>
   buf[0] === 0xff && buf[1] === 0xd8 ? 'jpg' :
@@ -63,39 +72,52 @@ const sniffExt = buf =>
 
 // async route helper: sends the returned value as JSON, maps thrown errors to a status
 const wrap = fn => (req, res) => Promise.resolve().then(() => fn(req, res)).then(out => res.json(out)).catch(e => {
-  console.error(e);
+  if (!e.status) console.error(e);
   res.status(e.status || 500).json({ error: e.message });
 });
 
 // ---------- items ----------
 app.get('/api/items', (req, res) => res.json(listItems({ status: req.query.status, q: req.query.q })));
 
-app.post('/api/items', (req, res) => {
-  const v = itemValues(req.body || {});
-  if (!v.title) return res.status(400).json({ error: 'Title is required' });
+app.post('/api/items', wrap(req => {
+  const b = req.body || {};
+  const v = itemValues(b);
+  if (!v.title) throw fail(400, 'Title is required');
   v.bought_date ||= today();
   const keys = Object.keys(v);
   const r = db.prepare(`INSERT INTO items (${keys.join(',')}) VALUES (${keys.map(() => '?').join(',')})`).run(...keys.map(k => v[k]));
-  res.status(201).json(getItem(Number(r.lastInsertRowid)));
-});
+  const id = Number(r.lastInsertRowid);
+  // "Add again" from history: reuse the old item's photos (copied, so deleting either item keeps the other's pictures).
+  if (b.copy_photos_from) {
+    for (const p of db.prepare('SELECT filename, hash FROM photos WHERE item_id=? ORDER BY id').all(Number(b.copy_photos_from))) {
+      const ext = path.extname(p.filename);
+      const filename = `${crypto.randomUUID()}${ext}`;
+      try { fs.copyFileSync(path.join(UPLOAD_DIR, p.filename), path.join(UPLOAD_DIR, filename)); } catch { continue; }
+      db.prepare('INSERT INTO photos (item_id, filename, hash) VALUES (?,?,?)').run(id, filename, p.hash);
+    }
+  }
+  return getItem(id);
+}));
 
 app.get('/api/items/:id', (req, res) => {
   const item = getItem(Number(req.params.id));
   item ? res.json(item) : res.status(404).json({ error: 'Not found' });
 });
 
-app.put('/api/items/:id', (req, res) => {
+app.put('/api/items/:id', wrap(req => {
   const id = Number(req.params.id);
-  if (!getItem(id)) return res.status(404).json({ error: 'Not found' });
+  const cur = getItem(id);
+  if (!cur) throw fail(404, 'Not found');
   const v = itemValues(req.body || {});
-  delete v.status; // status changes only via list/sell endpoints
+  const wanted = v.status;
+  delete v.status;
+  if (v.quantity !== undefined && v.quantity < cur.sold_qty) throw fail(400, `You've already sold ${cur.sold_qty} of these — quantity can't go below that`);
   const keys = Object.keys(v);
   if (keys.length) db.prepare(`UPDATE items SET ${keys.map(k => `${k}=?`).join(',')} WHERE id=?`).run(...keys.map(k => v[k]), id);
-  if (req.body?.status && getItem(id).status !== 'sold' && ['in_stock', 'listed'].includes(req.body.status)) {
-    db.prepare('UPDATE items SET status=? WHERE id=?').run(req.body.status, id);
-  }
-  res.json(getItem(id));
-});
+  recalcStatus(id);
+  if (['in_stock', 'listed'].includes(wanted) && getItem(id).remaining > 0) db.prepare('UPDATE items SET status=? WHERE id=?').run(wanted, id);
+  return getItem(id);
+}));
 
 app.delete('/api/items/:id', (req, res) => {
   const id = Number(req.params.id);
@@ -108,22 +130,23 @@ app.delete('/api/items/:id', (req, res) => {
 // ---------- photos ----------
 function savePhoto(buf) {
   const ext = sniffExt(buf);
-  if (!ext) throw Object.assign(new Error('Unsupported image (use JPEG, PNG or WebP)'), { status: 415 });
+  if (!ext) throw fail(415, 'Unsupported image (use JPEG, PNG or WebP)');
   const filename = `${crypto.randomUUID()}.${ext}`;
   fs.writeFileSync(path.join(UPLOAD_DIR, filename), buf);
   return filename;
 }
 
 const imageBody = req => {
-  if (!Buffer.isBuffer(req.body) || !req.body.length) throw Object.assign(new Error('No image body'), { status: 400 });
+  if (!Buffer.isBuffer(req.body) || !req.body.length) throw fail(400, 'No image body');
   return req.body;
 };
 
 app.post('/api/items/:id/photos', wrap(req => {
   const id = Number(req.params.id);
-  if (!getItem(id)) throw Object.assign(new Error('Not found'), { status: 404 });
+  if (!getItem(id)) throw fail(404, 'Not found');
   const filename = savePhoto(imageBody(req));
-  db.prepare('INSERT INTO photos (item_id, filename) VALUES (?,?)').run(id, filename);
+  const hash = String(req.headers['x-image-hash'] || '');
+  db.prepare('INSERT INTO photos (item_id, filename, hash) VALUES (?,?,?)').run(id, filename, HASH_RE.test(hash) ? hash : null);
   return getItem(id);
 }));
 
@@ -136,53 +159,78 @@ app.delete('/api/photos/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- sell / unsell ----------
-app.post('/api/items/:id/sell', (req, res) => {
-  const id = Number(req.params.id);
-  if (!getItem(id)) return res.status(404).json({ error: 'Not found' });
-  const b = req.body || {};
-  const price = num(b.sold_price);
-  if (!b.platform || !(price >= 0) || b.sold_price === '' || b.sold_price == null) return res.status(400).json({ error: 'Platform and sold price are required' });
-  db.exec('BEGIN');
-  try {
-    db.prepare(`INSERT INTO sales (item_id, platform, sold_price, fees, shipping, sold_date, notes) VALUES (?,?,?,?,?,?,?)
-                ON CONFLICT(item_id) DO UPDATE SET platform=excluded.platform, sold_price=excluded.sold_price,
-                fees=excluded.fees, shipping=excluded.shipping, sold_date=excluded.sold_date, notes=excluded.notes`)
-      .run(id, String(b.platform), price, num(b.fees), num(b.shipping), b.sold_date || today(), String(b.notes || ''));
-    db.prepare("UPDATE items SET status='sold' WHERE id=?").run(id);
-    db.exec('COMMIT');
-  } catch (e) { db.exec('ROLLBACK'); throw e; }
-  res.json(getItem(id));
+// "Looks like" search: client sends a fingerprint of the photo it just took; we return the closest items.
+app.post('/api/similar', (req, res) => {
+  const hash = String(req.body?.hash || '');
+  if (!HASH_RE.test(hash)) return res.status(400).json({ error: 'Bad image fingerprint' });
+  const photos = db.prepare('SELECT item_id, hash FROM photos WHERE hash IS NOT NULL').all();
+  let ranked = rank(hash, photos, 30).map(r => ({ item: getItem(r.item_id), score: r.score })).filter(r => r.item);
+  if (req.body.unsold) ranked = ranked.filter(r => r.item.remaining > 0);
+  res.json({ photosIndexed: photos.length, matches: ranked.slice(0, 6).map(r => ({ ...r.item, score: Math.round(r.score * 100) / 100 })) });
 });
 
-app.delete('/api/items/:id/sell', (req, res) => {
-  const id = Number(req.params.id);
-  db.prepare('DELETE FROM sales WHERE item_id=?').run(id);
-  db.prepare("UPDATE items SET status='in_stock' WHERE id=?").run(id);
-  res.json(getItem(id));
-});
+// ---------- sales (one row per sale event; an item can be sold in several pieces) ----------
+const saleFields = (b, qtyLimit) => {
+  const qty = Math.max(1, Math.floor(num(b.qty ?? 1)) || 1);
+  if (qty > qtyLimit) throw fail(400, qtyLimit > 0 ? `Only ${qtyLimit} left to sell` : 'None left to sell');
+  if (!b.platform || b.sold_price === '' || b.sold_price == null || num(b.sold_price) < 0) throw fail(400, 'Platform and sold price are required');
+  return [qty, String(b.platform), num(b.sold_price), num(b.fees), num(b.shipping), b.sold_date || today(), String(b.notes || '')];
+};
 
-// ---------- lookup helpers ----------
-app.get('/api/upc/:code', wrap(async req => {
-  const code = req.params.code.replace(/\D/g, '');
-  const existing = listItems({ q: code }).filter(i => i.upc === code);
-  return { product: await lookupUpc(code), existing };
+app.get('/api/sales', (_req, res) => res.json(listSales()));
+
+app.post('/api/items/:id/sell', wrap(req => {
+  const id = Number(req.params.id);
+  const item = getItem(id);
+  if (!item) throw fail(404, 'Not found');
+  const f = saleFields(req.body || {}, item.remaining);
+  db.prepare('INSERT INTO sales (item_id, qty, platform, sold_price, fees, shipping, sold_date, notes) VALUES (?,?,?,?,?,?,?,?)').run(id, ...f);
+  recalcStatus(id);
+  return getItem(id);
 }));
 
+app.put('/api/sales/:id', wrap(req => {
+  const sale = getSale(Number(req.params.id));
+  if (!sale) throw fail(404, 'Not found');
+  const item = getItem(sale.item_id);
+  const f = saleFields(req.body || {}, item.quantity - soldQty(sale.item_id, sale.id));
+  db.prepare('UPDATE sales SET qty=?, platform=?, sold_price=?, fees=?, shipping=?, sold_date=?, notes=? WHERE id=?').run(...f, sale.id);
+  recalcStatus(sale.item_id);
+  return getItem(sale.item_id);
+}));
+
+app.delete('/api/sales/:id', wrap(req => {
+  const sale = getSale(Number(req.params.id));
+  if (!sale) throw fail(404, 'Not found');
+  db.prepare('DELETE FROM sales WHERE id=?').run(sale.id);
+  recalcStatus(sale.item_id);
+  return getItem(sale.item_id);
+}));
+
+// ---------- barcode lookup ----------
+// Order: (1) your own past items with that barcode (instant, works for anything you have bought before),
+// (2) UPCitemdb, (3) Open Food Facts. See upc.js.
+app.get('/api/upc/:code', wrap(async req => {
+  const code = normUpc(req.params.code);
+  const existing = listItems({ q: code }).filter(i => i.upc === code);
+  if (existing.length) {
+    const p = existing[0];
+    return { product: { source: 'history', upc: code, title: p.title, brand: p.brand, category: p.category, condition: p.condition, size: p.size }, existing };
+  }
+  return { ...(await lookupUpc(code)), existing };
+}));
+
+// Optional AI helpers (only when AI_PROVIDER is set up)
 app.post('/api/identify', wrap(async req => {
-  const buf = imageBody(req);
-  const mime = req.headers['content-type'].split(';')[0];
-  const ai = await identify(buf, mime);
-  const all = listItems();
-  const matches = findMatches(ai, all).map(m => ({ ...m.item, score: Math.round(m.score * 100) / 100 }));
-  const upcProduct = ai.upc ? await lookupUpc(ai.upc) : null;
+  const ai = await identify(imageBody(req), req.headers['content-type'].split(';')[0]);
+  const matches = findMatches(ai, listItems()).map(m => ({ ...m.item, score: Math.round(m.score * 100) / 100 }));
+  const upcProduct = ai.upc ? (await lookupUpc(ai.upc)).product : null;
   return { ai, upcProduct, matches };
 }));
 
-// ---------- listing text generator ----------
 app.post('/api/items/:id/listing', wrap(async req => {
   const item = getItem(Number(req.params.id));
-  if (!item) throw Object.assign(new Error('Not found'), { status: 404 });
+  if (!item) throw fail(404, 'Not found');
   let photo = null;
   const first = db.prepare('SELECT filename FROM photos WHERE item_id=? ORDER BY id LIMIT 1').get(item.id);
   if (first) {
@@ -206,30 +254,28 @@ app.post('/api/expenses', (req, res) => {
 });
 app.delete('/api/expenses/:id', (req, res) => { deleteExpense(Number(req.params.id)); res.json(listExpenses()); });
 
-app.get('/api/settings', (_req, res) => res.json({ goal: getSetting('goal', 0), mileage_rate: getSetting('mileage_rate', 0.7) }));
+const settings = () => ({ goal: getSetting('goal', 0), mileage_rate: getSetting('mileage_rate', 0.7) });
+app.get('/api/settings', (_req, res) => res.json(settings()));
 app.put('/api/settings', (req, res) => {
   if (req.body?.goal !== undefined) setSetting('goal', Math.max(0, num(req.body.goal)));
   if (req.body?.mileage_rate !== undefined) setSetting('mileage_rate', Math.max(0, num(req.body.mileage_rate)));
-  res.json({ goal: getSetting('goal', 0), mileage_rate: getSetting('mileage_rate', 0.7) });
+  res.json(settings());
 });
 
-// ---------- fees, stats, export ----------
+// ---------- fees, stats, exports ----------
 app.get('/api/fees', (_req, res) => res.json(getFees()));
 app.put('/api/fees', (req, res) => { setFees(req.body); res.json(getFees()); });
 app.get('/api/stats', (_req, res) => res.json(stats()));
 
-app.get('/api/export.csv', (_req, res) => {
-  const cols = ['id', 'title', 'brand', 'category', 'condition', 'size', 'upc', 'cost', 'list_price', 'days_held', 'bought_date', 'bought_from', 'status', 'platform', 'sold_price', 'fees', 'shipping', 'sold_date', 'profit', 'notes'];
-  const esc = v => v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
-  const rows = listItems().map(i => cols.map(c => esc(i[c])).join(','));
-  res.type('text/csv').attachment('resale-export.csv').send([cols.join(','), ...rows].join('\n'));
-});
+const csvEsc = v => v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
+const sendCsv = (res, name, cols, rows) =>
+  res.type('text/csv').attachment(name).send([cols.join(','), ...rows.map(r => cols.map(c => csvEsc(r[c])).join(','))].join('\n'));
 
-app.get('/api/expenses.csv', (_req, res) => {
-  const cols = ['date', 'category', 'amount', 'miles', 'note'];
-  const esc = v => v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
-  res.type('text/csv').attachment('expenses-export.csv').send([cols.join(','), ...listExpenses().map(e => cols.map(c => esc(e[c])).join(','))].join('\n'));
-});
+app.get('/api/export.csv', (_req, res) => sendCsv(res, 'inventory-export.csv',
+  ['id', 'title', 'brand', 'category', 'condition', 'size', 'upc', 'cost', 'quantity', 'sold_qty', 'remaining', 'list_price', 'days_held', 'bought_date', 'bought_from', 'status', 'profit', 'notes'], listItems()));
+app.get('/api/sales.csv', (_req, res) => sendCsv(res, 'sales-export.csv',
+  ['sold_date', 'title', 'brand', 'platform', 'qty', 'sold_price', 'fees', 'shipping', 'cost', 'profit', 'notes'], listSales()));
+app.get('/api/expenses.csv', (_req, res) => sendCsv(res, 'expenses-export.csv', ['date', 'category', 'amount', 'miles', 'note'], listExpenses()));
 
 // Container stop/update sends SIGTERM: finish requests and close SQLite so the WAL is flushed into the db file.
 const server = app.listen(PORT, () => console.log(`resale-tracker listening on :${PORT} (AI: ${aiEnabled() ? process.env.AI_PROVIDER : 'off'}, auth: ${PASSWORD ? 'on' : 'off'})`));

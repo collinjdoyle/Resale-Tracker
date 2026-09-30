@@ -3,7 +3,7 @@
   "short_name": "Resale",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#f6f7f8",
-  "theme_color": "#d6527a",
+  "background_color": "#effffc",
+  "theme_color": "#ff3d9a",
   "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
 }
