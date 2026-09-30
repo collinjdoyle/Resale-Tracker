@@ -190,4 +190,8 @@ app.get('/api/export.csv', (_req, res) => {
   res.type('text/csv').attachment('resale-export.csv').send([cols.join(','), ...rows].join('\n'));
 });
 
-app.listen(PORT, () => console.log(`resale-tracker listening on :${PORT} (AI: ${aiEnabled() ? process.env.AI_PROVIDER : 'off'}, auth: ${PASSWORD ? 'on' : 'off'})`));
+// Container stop/update sends SIGTERM: finish requests and close SQLite so the WAL is flushed into the db file.
+const server = app.listen(PORT, () => console.log(`resale-tracker listening on :${PORT} (AI: ${aiEnabled() ? process.env.AI_PROVIDER : 'off'}, auth: ${PASSWORD ? 'on' : 'off'})`));
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => server.close(() => { try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); db.close(); } catch { /* already closed */ } process.exit(0); }));
+}
