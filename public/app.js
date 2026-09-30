@@ -76,11 +76,28 @@ async function barcodeFromImage(source) { // source: File/Blob (full-resolution 
   } catch { return null; }
 }
 
-// Live camera scan. Needs HTTPS (or localhost) for camera access.
+// Over plain HTTP the browser blocks live camera access, so "scan" opens the phone's camera app for a
+// photo of the barcode instead and reads the barcode from that picture.
+function scanFromPhoto() {
+  return new Promise(resolve => {
+    const input = document.createElement('input');
+    input.type = 'file'; input.accept = 'image/*'; input.setAttribute('capture', 'environment');
+    input.onchange = async () => {
+      const file = input.files[0];
+      if (!file) return resolve(null);
+      toast('Reading barcode…');
+      const code = await barcodeFromImage(file);
+      if (!code) toast("Couldn't read it — get closer, hold steady, keep the barcode flat and well lit");
+      resolve(code);
+    };
+    input.addEventListener('cancel', () => resolve(null));
+    input.click();
+  });
+}
+
+// Live camera scan. Needs HTTPS (or localhost); otherwise falls back to photo-of-barcode.
 async function scanBarcode() {
-  if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
-    toast('Live scan needs HTTPS. Use "Take photo" and point it at the barcode instead.'); return null;
-  }
+  if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) return scanFromPhoto();
   const wrap = document.createElement('div'); wrap.id = 'video-wrap';
   wrap.innerHTML = '<video playsinline muted></video><div class="scan-hint">Point at the barcode</div><button class="btn alt">Cancel</button>';
   document.body.append(wrap);
