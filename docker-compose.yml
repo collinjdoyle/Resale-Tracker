@@ -1,0 +1,16 @@
+# Unraid: Docker Compose Manager plugin -> "Add New Stack" -> paste this file,
+# and put the variables from .env.example in the stack's env file.
+services:
+  resale-tracker:
+    # Option A (recommended): prebuilt image from GitHub Container Registry.
+    # Make the package public (GitHub -> Packages -> settings), or `docker login ghcr.io` on Unraid.
+    image: ghcr.io/collinjdoyle/resale-tracker:latest
+    # Option B: build straight from the git repo instead (comment out `image` above):
+    # build: https://github.com/collinjdoyle/Resale-Tracker.git#main
+    container_name: resale-tracker
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file: .env
+    volumes:
+      - /mnt/user/appdata/resale-tracker:/data   # sqlite db + photos live here
