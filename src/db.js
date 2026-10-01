@@ -65,13 +65,38 @@ CREATE TABLE IF NOT EXISTS expenses (
 CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
 `);
 
+// ---- backups: consistent snapshots (VACUUM INTO) kept next to the data, e.g. /mnt/user/appdata/resale-tracker/backups ----
+const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+export function backupDb(tag = 'daily') {
+  fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+  const file = path.join(BACKUP_DIR, `resale-${tag}-${stamp}.db`);
+  db.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`);
+  // keep the newest 14 daily snapshots; pre-migration snapshots are never deleted automatically
+  for (const f of fs.readdirSync(BACKUP_DIR).filter(f => f.startsWith('resale-daily-')).sort().slice(0, -14)) fs.rmSync(path.join(BACKUP_DIR, f), { force: true });
+  return file;
+}
+// At most one daily snapshot per ~20 hours, no matter how often the container restarts.
+export function maybeDailyBackup() {
+  try {
+    const newest = fs.existsSync(BACKUP_DIR) ? fs.readdirSync(BACKUP_DIR).filter(f => f.startsWith('resale-daily-')).sort().pop() : null;
+    if (newest && Date.now() - fs.statSync(path.join(BACKUP_DIR, newest)).mtimeMs < 20 * 3600 * 1000) return;
+    if (db.prepare('SELECT COUNT(*) AS n FROM items').get().n > 0) backupDb('daily');
+  } catch (e) { console.error('backup failed (app keeps running):', e.message); }
+}
+
 // ---- additive migrations for databases created by earlier versions ----
 const cols = t => db.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
+if ((!cols('items').includes('list_price') || !cols('items').includes('quantity') || !cols('sales').includes('qty'))
+    && db.prepare('SELECT COUNT(*) AS n FROM items').get().n > 0) {
+  console.log('Database upgrade needed; saved a backup first:', backupDb('pre-migration'));
+}
 if (!cols('items').includes('list_price')) db.exec('ALTER TABLE items ADD COLUMN list_price REAL');
 if (!cols('items').includes('quantity')) db.exec('ALTER TABLE items ADD COLUMN quantity INTEGER NOT NULL DEFAULT 1');
 if (!cols('sales').includes('qty')) {
   // Old sales table had UNIQUE(item_id) (one sale per item); rebuild without it, every old sale becomes qty 1.
   db.exec('PRAGMA foreign_keys = OFF');
+  try {
   db.exec(`BEGIN;
     CREATE TABLE sales_new (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,6 +108,7 @@ if (!cols('sales').includes('qty')) {
     DROP TABLE sales;
     ALTER TABLE sales_new RENAME TO sales;
     COMMIT;`);
+  } catch (e) { try { db.exec('ROLLBACK'); } catch { /* no open transaction */ } throw e; } // data stays as it was; the container errors loudly instead of running half-migrated
   db.exec('PRAGMA foreign_keys = ON');
 }
 db.exec('CREATE INDEX IF NOT EXISTS idx_sales_item ON sales(item_id)');

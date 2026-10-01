@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   db, UPLOAD_DIR, STALE_DAYS, listItems, getItem, stats, getFees, setFees, getSetting, setSetting,
-  listExpenses, addExpense, deleteExpense, listSales, getSale, soldQty, recalcStatus,
+  listExpenses, addExpense, deleteExpense, listSales, getSale, soldQty, recalcStatus, maybeDailyBackup,
 } from './db.js';
 import { lookupUpc } from './upc.js';
 
@@ -246,6 +246,8 @@ app.get('/api/expenses.csv', (_req, res) => sendCsv(res, 'expenses-export.csv', 
 
 // Container stop/update sends SIGTERM: finish requests and close SQLite so the WAL is flushed into the db file.
 const server = app.listen(PORT, () => console.log(`resale-tracker listening on :${PORT} (auth: ${PASSWORD ? 'on' : 'off'})`));
+maybeDailyBackup();
+setInterval(maybeDailyBackup, 6 * 3600 * 1000).unref();
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, () => server.close(() => { try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); db.close(); } catch { /* already closed */ } process.exit(0); }));
 }

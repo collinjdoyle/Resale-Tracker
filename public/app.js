@@ -341,7 +341,8 @@ async function openItem(id) {
   const sales = i.sales.map(s => `<div class="sale-row" data-sale="${s.id}"><span><b>${s.qty}×</b> ${esc(FEES[s.platform]?.label || s.platform)} · ${esc(s.sold_date)}</span><span>${signed(s.profit)}</span></div>`).join('');
   openSheet(`
     <div class="photos" id="photos">${i.photos.map(p => `<div class="ph"><img src="${esc(p.url)}"><button class="x" data-p="${p.id}">×</button></div>`).join('')}</div>
-    <label class="btn alt sm" style="display:inline-block">📷 Add photo<input type="file" accept="image/*" capture="environment" hidden id="more-photo"></label>
+    <label class="btn alt sm">📷 Take photo<input type="file" accept="image/*" capture="environment" hidden id="more-photo"></label>
+    <label class="btn alt sm">🖼️ Upload photos<input type="file" accept="image/*" multiple hidden id="upload-photo"></label>
     <div class="card" style="margin-top:12px">
       <b>${open ? `${i.remaining} of ${i.quantity} left` : `All ${i.quantity} sold`}</b>${i.sold_qty ? ` <span class="muted">· ${i.sold_qty} sold · profit so far</span> ${signed(i.profit || 0)}` : ''}
       ${sales ? `<div class="sales-list">${sales}<div class="muted" style="margin-top:4px">Tap a sale to edit or undo it</div></div>` : ''}
@@ -362,7 +363,13 @@ async function openItem(id) {
   };
   $('#del').onclick = async () => { if (confirm('Delete this item, its photos and its sales history?')) { await api('/items/' + id, { method: 'DELETE' }); closeSheet(); refresh(); } };
   $('#again').onclick = () => { closeSheet(); addFromItem(i); };
-  $('#more-photo').onchange = async e => { const f = e.target.files[0]; if (!f) return; const blob = await shrink(f); await api(`/items/${id}/photos`, { body: blob }); openItem(id); refresh(); };
+  const attach = async e => {
+    const files = [...e.target.files]; if (!files.length) return;
+    toast(files.length > 1 ? `Adding ${files.length} photos…` : 'Adding photo…');
+    for (const f of files) { try { await api(`/items/${id}/photos`, { body: await shrink(f) }); } catch { toast(`Couldn't use "${f.name}" — try a JPEG or PNG`); } }
+    openItem(id); refresh();
+  };
+  $('#more-photo').onchange = $('#upload-photo').onchange = attach;
   document.querySelectorAll('#photos .x').forEach(b => (b.onclick = async () => { await api('/photos/' + b.dataset.p, { method: 'DELETE' }); openItem(id); refresh(); }));
   document.querySelectorAll('.sale-row').forEach(r => (r.onclick = () => openSell(i, i.sales.find(s => s.id === Number(r.dataset.sale)))));
   if (open) {
@@ -427,7 +434,7 @@ function openSell(i, sale = null) {
 async function renderSell() {
   view.innerHTML = `<h1>Mark an item sold</h1>
     <input id="q" type="search" placeholder="Search your stock…">
-    <div class="big-actions" style="margin-top:12px"><button class="btn alt" id="scan" type="button">▮▮▮ Scan barcode</button><label class="btn alt">📷 Barcode photo<input type="file" accept="image/*" capture="environment" hidden id="findp"></label></div>
+    <div class="big-actions" style="margin-top:12px"><button class="btn alt" id="scan" type="button">▮▮▮ Scan barcode</button><label class="btn alt">🖼️ Barcode photo<input type="file" accept="image/*" hidden id="findp"></label></div>
     <div id="banner"></div><div id="list" style="margin-top:12px"></div>`;
   const draw = async (items) => {
     items ??= (await api('/items?q=' + encodeURIComponent($('#q').value))).filter(i => i.status !== 'sold');
@@ -487,10 +494,11 @@ function renderAdd() {
   view.innerHTML = `<h1>Add item</h1>
     <div class="big-actions">
       <label class="btn">📷 Take photo<input type="file" accept="image/*" capture="environment" hidden id="cam"></label>
+      <label class="btn alt">🖼️ Upload photos<input type="file" accept="image/*" multiple hidden id="upload"></label>
       <button class="btn alt" id="scan" type="button">▮▮▮ Scan barcode</button>
+      <button class="btn alt" id="hist" type="button">🔁 Add from history</button>
     </div>
-    <button class="btn alt" id="hist" type="button" style="margin-top:12px">🔁 Add something I've had before</button>
-    <div class="muted" style="margin:8px 0">Scan the barcode (or take a photo of it) to fill in the details. Photos are saved with the item; if the barcode is read from your photo it's filled in automatically.</div>
+    <div class="muted" style="margin:8px 0">Scan the barcode (or take/upload a photo of it) to fill in the details. Photos are saved with the item; if a barcode is readable in a photo it's filled in automatically.</div>
     <div id="status">${pre ? `<div class="banner">Adding another <b>${esc(pre.title)}</b> — details copied${pre.photos?.length ? ' (photos too)' : ''}. Enter how many and what you paid.</div>` : ''}</div><div id="matches"></div>
     <form id="f"><div class="photos" id="pending"></div>${itemFields(pre || {})}
       <button class="btn" type="submit">Save item</button>
@@ -498,7 +506,12 @@ function renderAdd() {
     </form>`;
   const form = $('#f');
   wireCost(form);
-  $('#cam').onchange = async e => { for (const f of e.target.files) await addPhoto(f); e.target.value = ''; };
+  const onFiles = e => {
+    const files = [...e.target.files];
+    e.target.value = ''; // copy first, then reset so the same picture can be chosen again
+    if (files.length) addPhotos(files);
+  };
+  $('#cam').onchange = $('#upload').onchange = onFiles;
   $('#scan').onclick = async () => { const c = await scanBarcode(); if (c) { form.upc.value = c; fromBarcode(); } };
   $('#upc-go').onclick = () => fromBarcode();
   $('#hist').onclick = openHistory;
@@ -521,12 +534,22 @@ function renderAdd() {
     showMatches(r.existing, '<b>Already in your system?</b> Tap one to open it, or keep going to add a new batch.');
   }
 
-  async function addPhoto(file) {
-    const blob = await shrink(file);
-    draft.photos.push({ blob });
+  // Attach every chosen photo straight away (so Save never misses one), then look for a barcode in the background.
+  async function addPhotos(files) {
+    const added = [];
+    for (const f of files) {
+      try { draft.photos.push({ blob: await shrink(f) }); added.push(f); }
+      catch { toast(`Couldn't use "${f.name}" — try a JPEG or PNG`); }
+    }
     drawPending();
-    const code = !form.upc.value ? await barcodeFromImage(file) : null;
-    if (code) { form.upc.value = code; toast(`Read barcode ${code}`); return fromBarcode(); }
+    const status = html => { if (form.isConnected) $('#status').innerHTML = html; }; // she may have saved and left already
+    for (const f of added.slice(0, 3)) {
+      if (!form.isConnected || form.upc.value) return;
+      status('<div class="banner">Checking the photo for a barcode…</div>');
+      const code = await barcodeFromImage(f);
+      if (code && form.isConnected && !form.upc.value) { status(''); form.upc.value = code; toast(`Read barcode ${code}`); return fromBarcode(); }
+    }
+    if (form.isConnected && !form.upc.value) status('');
   }
 
   function drawPending() {
